@@ -3,23 +3,40 @@ import sys
 from dotenv import load_dotenv
 import json
 import os
-import importlib
-from variables import instructions  # Asumiendo que tienes algo en este archivo
+from variables import instructions, new_instructions  # Asumiendo que tienes algo en este archivo
 from supabase import create_client, Client  # pip install supabase
-
+from geminiTester import Gemini
+from openAiTester import OpenAI
+from openAiTesterO import OpenAIO
+from groqTester import GroqTester
 load_dotenv()
 
-def main(attendance_id):
+# Array con los modelos y su clase
+models_to_test = [
+    {"model": "gemini-2.0-flash-001", "class": Gemini},
+    {"model": "gemini-2.0-flash-lite-preview-02-05", "class": Gemini},
+    {"model": "gemini-2.0-pro-exp-02-05", "class": Gemini},
+    # {"model": "gpt-4o", "class": OpenAI},
+    {"model": "gpt-4o-mini", "class": OpenAI},
+    {"model": "o1-mini-2024-09-12", "class": OpenAIO},
+    # {"model": "o3-mini", "class": OpenAIO},
+    {"model": "deepseek-r1-distill-llama-70b", "class": GroqTester},
+    {"model": "llama-3.2-1b-preview", "class": GroqTester},
+    {"model": "llama-3.2-3b-preview", "class": GroqTester},
+    {"model": "gemma2-9b-it", "class": GroqTester},
+    # Agrega más modelos según sea necesario
+]
+
+
+def main(attendance_id, comments=None):
     # 1. Obtenemos datos de tu endpoint
     response = requests.get(f"https://api.novahiring.com/v1/public/questions/qa/{attendance_id}")
+    #response = requests.get(f"http://localhost:3000/v1/public/questions/qa/{attendance_id}")
     data = response.json()
+    # Verificamos si hay un objeto llamado 'questions' y añadimos todas las 'model_response'
+    modal_responses = [q["model_response"] for q in data["questions"]]
 
-    print(data)
-
-    # 2. Obtenemos todos los archivos .py (excepto main.py)
-    py_files = [f for f in os.listdir('.') if f.endswith('.py') and f != 'main.py']
-
-    # 3. Creamos cliente de Supabase
+    # 2. Creamos cliente de Supabase
     #    -> Asegúrate de tener SUPABASE_URL y SUPABASE_KEY definidas en tu entorno
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_KEY")
@@ -30,43 +47,49 @@ def main(attendance_id):
 
     supabase: Client = create_client(supabase_url, supabase_key)
 
-    # 4. Iteramos cada archivo, extraemos datos y subimos a Supabase
-    for py_file in py_files:
-        module_name = py_file[:-3]  # quitamos .py
-        module = importlib.import_module(module_name)
+    # 3. Iteramos sobre los modelos a probar
+    for model_info in models_to_test:
+        model_name = model_info["model"]
+        model_class = model_info["class"]
 
-        if hasattr(module, 'getModel') and hasattr(module, 'process_data'):
-            model = module.getModel()
-            print(f"Modelo en {py_file}: {model}")
+        tester = model_class(model_name)
+        model = tester.get_model()
+        print(f"Modelo: {model}")
 
-            try:
-                result = module.process_data(data)
-                print(f"Resultado de process_data en {py_file}: {result}")
-                
-                parsed_result = json.loads(result)
-                scores_list = parsed_result["scores"]
-                
-                # Calculamos la media
-                average_score = sum(scores_list) / len(scores_list)
+        try:
+            result = tester.obtain_score(new_instructions, data)
+            print(f"Resultado de obtain_score: {result}")
 
-                # Preparamos el diccionario a insertar en Supabase
-                row_to_insert = {
-                    "model": model,
-                    "attendance_id": int(attendance_id),
-                    "instructions": instructions,  # Esto puede ser lo que tú quieras.
-                    "average": average_score,
-                    "scores": scores_list
-                }
+            parsed_result = json.loads(result)
+            scores_list = parsed_result["scores"]
 
-                # 5. Insertamos en tu tabla "ai_benchmark"
-                response = supabase.table("ai_benchmark").insert(row_to_insert).execute()
+            # Calculamos la media
+            average_score = sum(scores_list) / len(scores_list)
 
-            except Exception as e:
-                print(f"Error procesando {py_file}: {e}")
+            # Preparamos el diccionario a insertar en Supabase
+            row_to_insert = {
+                "model": model,
+                "attendance_id": int(attendance_id),
+                "instructions": instructions,  # Esto puede ser lo que tú quieras.
+                "average": average_score,
+                "scores": scores_list,
+                "model_answers": modal_responses,  # Añadimos las respuestas modales
+                "comments": comments  # Añadimos los comentarios
+            }
+
+            # 4. Insertamos en tu tabla "ai_benchmark"
+            response = supabase.table("ai_benchmark").insert(row_to_insert).execute()
+
+        except Exception as e:
+            print(f"Error procesando {model_name}: {e}")
+
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Uso: python main.py <attendance_id>")
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        print("Uso: python main.py <attendance_id> [comments]")
         sys.exit(1)
     attendance_id = sys.argv[1]
-    main(attendance_id)
+    comments = sys.argv[2] if len(sys.argv) == 3 else None
+    n = 10  # Número de veces que quieres llamar a main
+    for _ in range(n):
+        main(attendance_id, comments)
