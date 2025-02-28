@@ -2,32 +2,116 @@ import os
 import json
 import requests
 import boto3
-import base64
-import psycopg2
+import time
+
 from dotenv import load_dotenv
+import google.generativeai as genai
 
-from google import genai
-from google.genai import types
-
-# Cargar las variables de entorno
+# Cargar variables de entorno
 load_dotenv()
 
+# Configuración de AWS
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
+
+# API key de Gemini
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# Configuración de Gemini
+PROJECT_ID = "ia-analyzer"
+MODEL_NAME = "gemini-2.0-flash-001"  # Cambia si usas otra versión
+
+# 1) Inicializamos generativeai con la API key
+genai.configure(api_key=GENAI_API_KEY)
+
+
+# 2) Funciones auxiliares para subir archivos a Gemini
+def upload_to_gemini(path, mime_type=None):
+    """
+    Sube un archivo local a Gemini. Retorna un objeto de tipo File,
+    el cual incluye, entre otros, la propiedad 'uri'.
+    """
+    file = genai.upload_file(path, mime_type=mime_type)
+    print(f"Archivo subido a Gemini: '{file.display_name}' => URI: {file.uri}")
+    return file
+
+def wait_for_files_active(files):
+    """
+    Espera a que el archivo (o lista de archivos) pase de estado 'PROCESSING' a 'ACTIVE' en Gemini.
+    """
+    print("Esperando a que los archivos procesen en Gemini...")
+    for name in (file.name for file in files):
+        file = genai.get_file(name)
+        while file.state.name == "PROCESSING":
+            print(".", end="", flush=True)
+            time.sleep(5)
+            file = genai.get_file(name)
+        if file.state.name != "ACTIVE":
+            raise Exception(f"El archivo {file.name} falló al procesarse (estado: {file.state.name})")
+    print("\nArchivos en estado ACTIVE.")
+
+
+# 3) Clase Gemini para manejar la creación del modelo y el chat
+class Gemini:
+    def __init__(self, system_instruction):
+        """
+        Crea una instancia del modelo generativo de Gemini con las instrucciones
+        del sistema y parámetros deseados.
+        """
+        self.client = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            generation_config={
+                "temperature": 1,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": 8192,
+                "response_mime_type": "application/json",
+            },
+            system_instruction=system_instruction
+        )
+
+    def start_chat(self, history=None):
+        """
+        Inicia un chat con un historial dado (lista de mensajes).
+        Cada mensaje debe tener la forma:
+          {
+            "role": "user" | "model",
+            "parts": [ { "text": "..." } ]
+          }
+        """
+        if history is None:
+            history = []
+        return self.client.start_chat(history=history)
+
+
+# 4) Función principal que utiliza la clase Gemini para procesar videos/preguntas
 def generate(attendanceId):
-    # 1. Obtener las preguntas relacionadas con el attendanceId
-    bucketName = "novahiring-uploads"
+    """
+    1. Obtiene las preguntas del endpoint local de questions/qa.
+    2. Obtiene los videos de S3 mediante URL prefirmada.
+    3. Crea un chat con Gemini y envía cada video+p+regunta.
+    4. Solicita el informe final.
+    """
+
+    # --- A) OBTENCIÓN DE PREGUNTAS Y VIDEOS ---
+    # 1. Obtener las preguntas
     response = requests.get(f"http://localhost:3000/v1/public/questions/qa/{attendanceId}")
     questions_data = response.json()
     if isinstance(questions_data, str):
         questions_data = json.loads(questions_data)
+
     questions = [q['title'] for q in questions_data["questions"]]
     print("Preguntas obtenidas:", questions)
 
-    # 2. Conectar a S3 y obtener los presigned URLs de los vídeos
+    # 2. Obtener URLs de videos desde S3
+    bucketName = "novahiring-uploads"
     s3_client = boto3.client(
         's3',
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        region_name=os.getenv('AWS_DEFAULT_REGION')
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_DEFAULT_REGION
     )
 
     prefix = f"response_videos/attendance-{attendanceId}/"
@@ -37,43 +121,27 @@ def generate(attendanceId):
     if 'Contents' in response_s3:
         for obj in response_s3['Contents']:
             key = obj['Key']
-            # Generar URL prefirmada (15 min)
             url_prefirmada = s3_client.generate_presigned_url(
                 'get_object',
                 Params={'Bucket': bucketName, 'Key': key},
-                ExpiresIn=900
+                ExpiresIn=900  # 15 minutos
             )
             video_urls.append(url_prefirmada)
 
     print("URLs de los videos:", video_urls)
 
-    # 3. Configurar el cliente de PaLM/Gemini
-    client = genai.Client(
-        vertexai=True,
-        project="ia-analyzer",
-        location="us-central1",
-    )
-
-    # 4. Instrucción del sistema:
+    # --- B) INSTRUCCIONES DE SISTEMA ---
     system_instruction_text = (
         "Eres un sistema de IA con capacidad real de análisis de video. Puedes ver, interpretar y describir "
-        "el lenguaje corporal, la expresión facial, la postura y otros indicadores para evaluar las siguientes "
-        "10 habilidades blandas (soft skills):\n"
-        "1) Comunicación,\n"
-        "2) Inteligencia Emocional,\n"
-        "3) Liderazgo,\n"
-        "4) Resolución de Problemas,\n"
-        "5) Trabajo en Equipo,\n"
-        "6) Ética Laboral,\n"
-        "7) Persuasión,\n"
-        "8) Adaptabilidad,\n"
-        "9) Enfoque ante la Retroalimentación,\n"
-        "10) Manejo del Estrés.\n\n"
+        "el lenguaje corporal, la expresión facial, la postura y otros indicadores para evaluar "
+        "las siguientes 10 habilidades blandas (soft skills): "
+        "1) Comunicación, 2) Inteligencia Emocional, 3) Liderazgo, 4) Resolución de Problemas, "
+        "5) Trabajo en Equipo, 6) Ética Laboral, 7) Persuasión, 8) Adaptabilidad, "
+        "9) Enfoque ante la Retroalimentación, 10) Manejo del Estrés.\n\n"
         "Para cada video y pregunta que se te proporcione, analiza el contenido y describe lo que observas "
-        "en la persona (ej. lenguaje corporal, tono de voz, etc.) y cómo se relaciona con las habilidades blandas. "
-        "Deberás responder con una descripción y terminar tu respuesta siempre con la frase: "
-        "\"Esperando siguiente pregunta\".\n\n"
-        "Cuando el usuario solicite el 'informe final', deberás devolver un JSON con el siguiente formato:\n"
+        "en la persona (lenguaje corporal, expresiones, etc.) y cómo se relaciona con las habilidades. "
+        "Responde con esa descripción y concluye con la frase: 'Esperando siguiente pregunta'.\n\n"
+        "Cuando se solicite el 'informe final', deberás devolver un JSON con este formato:\n"
         "{\n"
         "  \"habilities\": {\n"
         "    \"communication\": 0,\n"
@@ -87,120 +155,89 @@ def generate(attendanceId):
         "    \"feedback_handling\": 0,\n"
         "    \"stress_management\": 0\n"
         "  },\n"
-        "  \"summary\": \"Breve resumen del perfil del candidato...\",\n"
+        "  \"summary\": \"Resumen del perfil...\",\n"
         "  \"pros\": \"Puntos fuertes...\",\n"
         "  \"cons\": \"Puntos débiles...\",\n"
-        "  \"next_questions\": [\"...\" , \"...\"]\n"
+        "  \"next_questions\": [\"...\", \"...\"]\n"
         "}\n\n"
-        "En 'habilities', coloca una nota de 0 a 10 (o -1 si no se pudo evaluar). "
-        "No muestres el JSON en tus respuestas intermedias, ni lo menciones. "
-        "Solamente cuando se solicite explícitamente el informe final."
+        "En 'habilities', usa una nota de 0 a 10 (o -1 si no se pudo evaluar). "
+        "No muestres este JSON hasta que se solicite explícitamente."
     )
 
-    # 5. Configuración del modelo
-    model_name = "gemini-2.0-pro-exp-02-05"
-    generate_content_config = types.GenerateContentConfig(
-        temperature=1,
-        top_p=0.95,
-        max_output_tokens=8192,
-        response_modalities=["TEXT"],
-        safety_settings=[
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF")
-        ],
-        response_mime_type="application/json",
-        response_schema={"type": "OBJECT", "properties": {"response": {"type": "STRING"}}},
-        system_instruction=[types.Part.from_text(text=system_instruction_text)],
-    )
+    # --- C) INICIALIZAR GEMINI Y CHAT ---
+    gemini = Gemini(system_instruction=system_instruction_text)
+    # Historial inicial
+    chat_history = [
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "text": (
+                        "Hola, soy el entrevistador. "
+                        "Te pasaré videos y preguntas para que me ayudes a evaluar las soft skills. "
+                        "Termina cada respuesta con 'Esperando siguiente pregunta'."
+                    )
+                }
+            ]
+        }
+    ]
 
-    # 6. Historial de conversación en texto (rol user/model)
-    conversation_history = []
+    # Iniciamos la sesión de chat con este historial
+    chat_session = gemini.start_chat(history=chat_history)
 
-    # 7. Primer mensaje de usuario (inicial)
-    initial_user_message = (
-        "Hola, soy el entrevistador. Vamos a comenzar con la evaluación. "
-        "Te mandaré varios videos y preguntas para que hagas tu descripción y evalúes brevemente "
-        "lo que observes respecto a las habilidades blandas."
-    )
-    conversation_history.append(
-        types.Content(role="user", parts=[types.Part.from_text(text=initial_user_message)])
-    )
-
-    # 7.1 Primera petición al modelo
-    initial_response = client.models.generate_content(
-        model=model_name,
-        contents=conversation_history,
-        config=generate_content_config,
-    )
+    # Mensaje inicial
+    initial_response = chat_session.send_message({
+        "parts": [
+            {"text": "Vamos a comenzar la evaluación."}
+        ]
+    })
     print("Respuesta inicial del modelo:\n", initial_response.text)
 
-    # Añadimos la respuesta del modelo al historial
-    conversation_history.append(
-        types.Content(role="model", parts=[types.Part.from_text(text=initial_response.text)])
-    )
-
-    # Guardamos esta respuesta en bot_responses
+    # Guardar respuestas en una lista
     bot_responses = [{"role": "model", "text": initial_response.text}]
 
-    # 8. Iteramos cada pregunta con su video
+    # --- D) PROCESAR CADA PREGUNTA Y VIDEO ---
     for i, (question, video_url) in enumerate(zip(questions, video_urls), start=1):
-        print(f"\n=== Procesando pregunta {i}/{len(questions)} ===")
-        print("Video URL:", video_url)
-        print("Pregunta :", question)
+        print(f"\n=== Procesando pregunta {i} de {len(questions)} ===")
 
-        # a) Construir contents con historial + video + pregunta
-        current_contents = list(conversation_history)
+        # 1. Descargar el video
+        video_resp = requests.get(video_url)
+        if video_resp.status_code != 200:
+            print("Error al descargar el video:", video_resp.status_code)
+            continue
 
-        # b) Añadimos el video como usuario
-        current_contents.append(
-            types.Content(role="user", parts=[types.Part.from_uri(file_uri=video_url, mime_type="video/mp4")])
+        local_video_path = f"./tmp_video_{attendanceId}_{i}.mp4"
+        with open(local_video_path, "wb") as f:
+            f.write(video_resp.content)
+        print("Video guardado localmente:", local_video_path)
+
+        # 2. Subir el video a Gemini
+        video_file = upload_to_gemini(local_video_path, mime_type="video/mp4")
+        wait_for_files_active([video_file])
+
+        # 3. Mandar un mensaje al modelo con el archivo + la pregunta
+        #    Usamos "parts" con uno que sea el archivo (uri + mime_type)
+        #    y otro con el texto (la pregunta).
+        response_msg = chat_session.send_message(
+            [
+                "Pregunta: " + question,     # Texto
+                video_file                 # El objeto 'File' subido
+            ]
         )
 
-        # c) Añadimos la pregunta como usuario
-        current_contents.append(
-            types.Content(role="user", parts=[types.Part.from_text(text=question)])
-        )
+        print("Respuesta del modelo:\n", response_msg.text)
+        bot_responses.append({"role": "model", "text": response_msg.text})
 
-        # d) Petición al modelo
-        response = client.models.generate_content(
-            model=model_name,
-            contents=current_contents,
-            config=generate_content_config,
-        )
-        print(f"Respuesta del modelo tras la pregunta {i}:\n", response.text)
+    # --- E) SOLICITAR INFORME FINAL ---
+    print("\n=== Solicitando informe final... ===")
+    final_msg = chat_session.send_message({"parts": [{"text": "Solicitar informe final"}]})
+    print("Informe final:\n", final_msg.text)
 
-        # e) Añadimos al historial (solo el texto de la pregunta y de la respuesta)
-        conversation_history.append(
-            types.Content(role="user", parts=[types.Part.from_text(text=question)])
-        )
-        conversation_history.append(
-            types.Content(role="model", parts=[types.Part.from_text(text=response.text)])
-        )
+    bot_responses.append({"role": "model", "text": final_msg.text})
 
-        # f) Guardamos en bot_responses
-        bot_responses.append({"role": "model", "text": response.text})
-
-    # 9. Cuando se haya terminado, solicitamos el informe final
-    final_contents = list(conversation_history)
-    final_contents.append(
-        types.Content(role="user", parts=[types.Part.from_text(text="Solicitar informe final")])
-    )
-
-    final_response = client.models.generate_content(
-        model=model_name,
-        contents=final_contents,
-        config=generate_content_config,
-    )
-
-    print("\n=== Informe final solicitado ===")
-    print(final_response.text)
-
-    bot_responses.append({"role": "model", "text": final_response.text})
-    return bot_responses, final_response.text
+    return bot_responses, final_msg.text
 
 
+# Llamada de ejemplo local
 if __name__ == "__main__":
-    # Ejemplo de llamada
     generate(1676)
