@@ -3,6 +3,9 @@ import json
 import requests
 import boto3
 import time
+import re
+import shutil
+from supabase import create_client
 
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -22,6 +25,11 @@ GENAI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # Configuración de Gemini
 PROJECT_ID = "ia-analyzer"
 MODEL_NAME = "gemini-2.0-flash-001"  # Cambia si usas otra versión
+
+# Configuración de Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # 1) Inicializamos generativeai con la API key
 genai.configure(api_key=GENAI_API_KEY)
@@ -51,6 +59,39 @@ def wait_for_files_active(files):
         if file.state.name != "ACTIVE":
             raise Exception(f"El archivo {file.name} falló al procesarse (estado: {file.state.name})")
     print("\nArchivos en estado ACTIVE.")
+
+
+def clean_filename(text):
+    """
+    Limpia y prepara un texto para ser usado como nombre de archivo.
+    Toma los primeros 20 caracteres y reemplaza espacios por guiones bajos.
+    """
+    # Removemos caracteres especiales y espacios extras
+    clean_text = re.sub(r'[^\w\s-]', '', text)
+    # Reemplazamos espacios por guiones bajos
+    clean_text = re.sub(r'\s+', '_', clean_text.strip())
+    # Tomamos los primeros 20 caracteres
+    return clean_text[:20]
+
+
+def ensure_tmp_dir():
+    """
+    Asegura que existe el directorio tmp y lo limpia si ya existe
+    """
+    tmp_dir = "./tmp"
+    if os.path.exists(tmp_dir):
+        # Limpia el contenido existente
+        shutil.rmtree(tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+def cleanup_tmp_dir():
+    """
+    Limpia el directorio tmp al finalizar
+    """
+    tmp_dir = "./tmp"
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir, exist_ok=True)
 
 
 # 3) Clase Gemini para manejar la creación del modelo y el chat
@@ -87,20 +128,52 @@ class Gemini:
 
 
 # 4) Función principal que utiliza la clase Gemini para procesar videos/preguntas
-def generate(attendanceId):
+def save_analysis_results(attendance_id, analysis_data):
+    """
+    Guarda los resultados del análisis en Supabase
+    """
+    try:
+        # Convertir el texto JSON a diccionario si es necesario
+        if isinstance(analysis_data, str):
+            analysis_data = json.loads(analysis_data)
+        
+        # Preparar los datos para insertar
+        data = {
+            "attendance_id": attendance_id,
+            "habilities": analysis_data["habilities"],
+            "summary": analysis_data["summary"],
+            "pros": analysis_data["pros"],
+            "cons": analysis_data["cons"],
+            "next_questions": analysis_data["next_questions"]
+        }
+        
+        # Insertar en la tabla analysis_results
+        result = supabase.table("analysis_results").insert(data).execute()
+        print("Resultados guardados en Supabase:", result)
+        return result
+    except Exception as e:
+        print("Error al guardar en Supabase:", str(e))
+        raise e
+
+def generate(candidateId):
     """
     1. Obtiene las preguntas del endpoint local de questions/qa.
     2. Obtiene los videos de S3 mediante URL prefirmada.
     3. Crea un chat con Gemini y envía cada video+p+regunta.
     4. Solicita el informe final.
+    5. Guarda los resultados en Supabase.
     """
+    # Aseguramos que tmp está limpio al inicio
+    ensure_tmp_dir()
 
     # --- A) OBTENCIÓN DE PREGUNTAS Y VIDEOS ---
     # 1. Obtener las preguntas
-    response = requests.get(f"http://localhost:3000/v1/public/questions/qa/{attendanceId}")
+    response = requests.get(f"https://api.novahiring.com/v1/public/questions/qa/{candidateId}")
     questions_data = response.json()
     if isinstance(questions_data, str):
         questions_data = json.loads(questions_data)
+        
+    print("Respuesta de preguntas:", questions_data)
 
     questions = [q['title'] for q in questions_data["questions"]]
     print("Preguntas obtenidas:", questions)
@@ -114,19 +187,25 @@ def generate(attendanceId):
         region_name=AWS_DEFAULT_REGION
     )
 
-    prefix = f"response_videos/attendance-{attendanceId}/"
-    response_s3 = s3_client.list_objects_v2(Bucket=bucketName, Prefix=prefix)
-
-    video_urls = []
-    if 'Contents' in response_s3:
-        for obj in response_s3['Contents']:
-            key = obj['Key']
+    # Crear diccionario de video_urls usando question.id
+    video_urls = {}
+    for question in questions_data["questions"]:
+        question_id = question['id']
+        video_key = question['videoUrl']
+        
+        try:
+            # Verificar si el objeto existe
+            s3_client.head_object(Bucket=bucketName, Key=video_key)
+            # Si existe, generar URL prefirmada
             url_prefirmada = s3_client.generate_presigned_url(
                 'get_object',
-                Params={'Bucket': bucketName, 'Key': key},
+                Params={'Bucket': bucketName, 'Key': video_key},
                 ExpiresIn=900  # 15 minutos
             )
-            video_urls.append(url_prefirmada)
+            video_urls[question_id] = url_prefirmada
+        except:
+            print(f"No se encontró el video para la pregunta {question_id}")
+            continue
 
     print("URLs de los videos:", video_urls)
 
@@ -197,16 +276,23 @@ def generate(attendanceId):
     bot_responses = [{"role": "model", "text": initial_response.text}]
 
     # --- D) PROCESAR CADA PREGUNTA Y VIDEO ---
-    for i, (question, video_url) in enumerate(zip(questions, video_urls), start=1):
-        print(f"\n=== Procesando pregunta {i} de {len(questions)} ===")
+    for question in questions_data["questions"]:
+        question_id = question['id']
+        if question_id not in video_urls:
+            print(f"Saltando pregunta {question_id} - No se encontró video")
+            continue
+            
+        print(f"\n=== Procesando pregunta {question['title']} ===")
 
         # 1. Descargar el video
-        video_resp = requests.get(video_url)
+        video_resp = requests.get(video_urls[question_id])
         if video_resp.status_code != 200:
-            print("Error al descargar el video:", video_resp.status_code)
+            print(f"Error al descargar el video para pregunta {question_id}:", video_resp.status_code)
             continue
 
-        local_video_path = f"./tmp_video_{attendanceId}_{i}.mp4"
+        # Crear nombre de archivo basado en la pregunta
+        video_filename = clean_filename(question['title'])
+        local_video_path = os.path.join("tmp", f"video_{video_filename}_{attendanceId}.mp4")
         with open(local_video_path, "wb") as f:
             f.write(video_resp.content)
         print("Video guardado localmente:", local_video_path)
@@ -220,11 +306,12 @@ def generate(attendanceId):
         #    y otro con el texto (la pregunta).
         response_msg = chat_session.send_message(
             [
-                "Pregunta: " + question,     # Texto
+                "Pregunta: " + question['title'],     # Texto
                 video_file                 # El objeto 'File' subido
             ]
         )
 
+        print("Pregunta enviada al modelo:", question['title'])
         print("Respuesta del modelo:\n", response_msg.text)
         bot_responses.append({"role": "model", "text": response_msg.text})
 
@@ -235,9 +322,21 @@ def generate(attendanceId):
 
     bot_responses.append({"role": "model", "text": final_msg.text})
 
+    # Guardar resultados en Supabase
+    save_analysis_results(attendanceId, final_msg.text)
+
+    # Limpiar directorio tmp al finalizar
+    cleanup_tmp_dir()
+
     return bot_responses, final_msg.text
 
 
 # Llamada de ejemplo local
 if __name__ == "__main__":
-    generate(1676)
+    import sys
+    if len(sys.argv) != 2:
+        print("Uso: python main.py <candidateId>")
+        sys.exit(1)
+    
+    candidateId = int(sys.argv[1])
+    generate(candidateId)
