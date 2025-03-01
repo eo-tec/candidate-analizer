@@ -29,6 +29,8 @@ MODEL_NAME = "gemini-2.0-flash-001"  # Cambia si usas otra versión
 # Configuración de Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+print("Conectando a Supabase:", SUPABASE_URL)
+print("Llave de Supabase:", SUPABASE_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # 1) Inicializamos generativeai con la API key
@@ -130,30 +132,70 @@ class Gemini:
 # 4) Función principal que utiliza la clase Gemini para procesar videos/preguntas
 def save_analysis_results(attendance_id, analysis_data):
     """
-    Guarda los resultados del análisis en Supabase
+    Guarda los resultados del análisis en Supabase usando columnas individuales para cada habilidad
     """
     try:
         # Convertir el texto JSON a diccionario si es necesario
         if isinstance(analysis_data, str):
-            analysis_data = json.loads(analysis_data)
+            try:
+                analysis_data = json.loads(analysis_data)
+            except json.JSONDecodeError as e:
+                print("Error al decodificar JSON:", str(e))
+                print("Texto recibido:", analysis_data)
+                return None
+
+        # Verify we have a valid JSON object
+        if not isinstance(analysis_data, dict):
+            print("Los datos no son un objeto JSON válido")
+            return None
+
+        # Validar que el JSON tiene la estructura esperada
+        required_fields = ["habilities", "summary", "pros", "cons", "next_questions"]
+        missing_fields = [field for field in required_fields if field not in analysis_data]
+        if missing_fields:
+            print(f"Faltan campos requeridos en el JSON: {missing_fields}")
+            return None
         
-        # Preparar los datos para insertar
+        # Preparar los datos para insertar con las columnas individuales
         data = {
             "attendance_id": attendance_id,
-            "habilities": analysis_data["habilities"],
+            "communication": analysis_data["habilities"]["communication"],
+            "emotional_intelligence": analysis_data["habilities"]["emotional_intelligence"],
+            "leadership": analysis_data["habilities"]["leadership"],
+            "problem_solving": analysis_data["habilities"]["problem_solving"],
+            "teamwork": analysis_data["habilities"]["teamwork"],
+            "work_ethic": analysis_data["habilities"]["work_ethic"],
+            "persuasion": analysis_data["habilities"]["persuasion"],
+            "adaptability": analysis_data["habilities"]["adaptability"],
+            "feedback_handling": analysis_data["habilities"]["feedback_handling"],
+            "stress_management": analysis_data["habilities"]["stress_management"],
             "summary": analysis_data["summary"],
             "pros": analysis_data["pros"],
             "cons": analysis_data["cons"],
             "next_questions": analysis_data["next_questions"]
         }
         
+        print("Intentando guardar en Supabase con datos:", json.dumps(data, indent=2))
+        
+        # Verificar conexión a Supabase
+        try:
+            # Test query to verify connection
+            supabase.table("analysis_results").select("id").limit(1).execute()
+        except Exception as e:
+            print("Error de conexión con Supabase:", str(e))
+            return None
+            
         # Insertar en la tabla analysis_results
         result = supabase.table("analysis_results").insert(data).execute()
-        print("Resultados guardados en Supabase:", result)
+        print("Respuesta de Supabase:", result)
         return result
+
     except Exception as e:
         print("Error al guardar en Supabase:", str(e))
-        raise e
+        print("Tipo de error:", type(e).__name__)
+        if 'data' in locals():
+            print("Datos que se intentaron guardar:", json.dumps(data, indent=2))
+        return None
 
 def generate(candidateId):
     """
@@ -292,7 +334,7 @@ def generate(candidateId):
 
         # Crear nombre de archivo basado en la pregunta
         video_filename = clean_filename(question['title'])
-        local_video_path = os.path.join("tmp", f"video_{video_filename}_{attendanceId}.mp4")
+        local_video_path = os.path.join("tmp", f"video_{video_filename}_{candidateId}.mp4")
         with open(local_video_path, "wb") as f:
             f.write(video_resp.content)
         print("Video guardado localmente:", local_video_path)
@@ -322,8 +364,10 @@ def generate(candidateId):
 
     bot_responses.append({"role": "model", "text": final_msg.text})
 
-    # Guardar resultados en Supabase
-    save_analysis_results(attendanceId, final_msg.text)
+    # Guardar resultados en Supabase (solo el informe final que sí es JSON)
+    result = save_analysis_results(candidateId, final_msg.text)
+    if result is None:
+        print("No se pudo guardar el análisis en Supabase")
 
     # Limpiar directorio tmp al finalizar
     cleanup_tmp_dir()
@@ -331,11 +375,55 @@ def generate(candidateId):
     return bot_responses, final_msg.text
 
 
-# Llamada de ejemplo local
+def test_db():
+    """
+    Verifica la conexión a la base de datos intentando insertar y eliminar un registro de prueba
+    """
+    try:
+        # Datos de prueba con las nuevas columnas individuales
+        test_data = {
+            "attendance_id": -1,  # ID negativo para prueba
+            "communication": -1,
+            "emotional_intelligence": -1,
+            "leadership": -1,
+            "problem_solving": -1,
+            "teamwork": -1,
+            "work_ethic": -1,
+            "persuasion": -1,
+            "adaptability": -1,
+            "feedback_handling": -1,
+            "stress_management": -1,
+            "summary": "Test connection",
+            "pros": "Test connection",
+            "cons": "Test connection",
+            "next_questions": ["Test question 1", "Test question 2"]
+        }
+        
+        # Insertar registro de prueba
+        result = supabase.table("analysis_results").insert(test_data).execute()
+        test_id = result.data[0]['id']
+        print("Registro de prueba insertado correctamente")
+        
+        # Eliminar el registro de prueba
+        supabase.table("analysis_results").delete().eq('id', test_id).execute()
+        print("Registro de prueba eliminado correctamente")
+        
+        return True
+        
+    except Exception as e:
+        print("Error verificando base de datos:", str(e))
+        return False
+
+# Modificar la sección principal para usar test_db
 if __name__ == "__main__":
     import sys
     if len(sys.argv) != 2:
         print("Uso: python main.py <candidateId>")
+        sys.exit(1)
+    
+    # Probar conexión a base de datos antes de procesar
+    if not test_db():
+        print("Error: No se pudo verificar la conexión a la base de datos")
         sys.exit(1)
     
     candidateId = int(sys.argv[1])
